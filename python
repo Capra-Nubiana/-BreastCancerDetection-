@@ -1,0 +1,117 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+!pip install h5py tensorflow numpy matplotlib
+import h5py
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+
+hdf5_file = '/content/drive/MyDrive/Mammogram/all_mias_scans.h5'
+with h5py.File(hdf5_file, 'r') as f:
+    print("Keys:", list(f.keys()))  # Display dataset keys
+    class_data = f['CLASS'][:]
+    scan_data = f['scan'][:]
+    print("Classes:", np.unique(class_data))
+    print("Scans shape:", scan_data.shape)  # Expected: (330, height, width)
+
+plt.imshow(scan_data[0], cmap='gray')
+plt.title(f"Class: {class_data[0].decode()}")
+plt.show()
+
+from tensorflow.image import resize
+# Normalize pixel values to [0, 1]
+normalized_scans = scan_data / 255.0
+# Resize images to (224, 224) for compatibility with pre-trained models
+resized_scans = np.array([resize(img[..., np.newaxis], (224, 224)) for img in normalized_scans])
+print("Resized scans shape:", resized_scans.shape)  # Expected: (330, 224, 224, 3)
+
+from tensorflow.keras.utils import to_categorical
+# Decode labels from byte format
+class_data = np.array([cls.decode() for cls in class_data])
+# Map class labels to numerical indices
+unique_classes = np.unique(class_data)
+class_indices = {cls: idx for idx, cls in enumerate(unique_classes)}
+numeric_labels = np.array([class_indices[cls] for cls in class_data])
+# Convert to one-hot encoding for classification
+one_hot_labels = to_categorical(numeric_labels, num_classes=len(unique_classes))
+print("One-hot encoded labels shape:", one_hot_labels.shape)
+
+from sklearn.model_selection import train_test_split
+# Split the dataset
+X_train, X_temp, y_train, y_temp = train_test_split(resized_scans, one_hot_labels, test_size=0.3, random_state=42)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+print(f"Train set: {X_train.shape}, {y_train.shape}")
+print(f"Validation set: {X_val.shape}, {y_val.shape}")
+print(f"Test set: {X_test.shape}, {y_test.shape}")
+
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Input
+
+# Load the ResNet50 model pre-trained on ImageNet
+base_model = ResNet50(weights='imagenet', include_top=False, input_tensor=Input(shape=(224, 224, 3)))
+# Freeze base model layers
+base_model.trainable = False
+# Add custom classification layers
+x = GlobalAveragePooling2D()(base_model.output)
+x = Dense(128, activation='relu')(x)
+output = Dense(len(unique_classes), activation='softmax')(x)
+model = Model(inputs=base_model.input, outputs=output)
+
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+model.summary()
+
+model.compile(
+    optimizer='adam',
+    loss='categorical_crossentropy',  # or 'sparse_categorical_crossentropy' if labels are integers
+    metrics=['accuracy']
+)
+
+# Expand grayscale images to 3-channel RGB
+X_train = np.repeat(X_train, 3, axis=-1)  # Shape becomes (None, 224, 224, 3)
+X_val = np.repeat(X_val, 3, axis=-1)
+X_test = np.repeat(X_test, 3, axis=-1)
+print("New shape for X_train:", X_train.shape)
+
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+datagen = ImageDataGenerator(
+    rotation_range=15,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    shear_range=0.1,
+    zoom_range=0.1,
+    horizontal_flip=True
+)
+datagen.fit(X_train)
+
+base_model.trainable = True
+for layer in base_model.layers[:-30]:  # Freeze the first layers; adjust the number as needed
+    layer.trainable = False
+
+from tensorflow.keras.optimizers import Adam
+model.compile(optimizer=Adam(learning_rate=1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
+
+from tensorflow.keras.regularizers import l2
+x = Dense(128, activation='relu', kernel_regularizer=l2(0.01))(x)
+
+import cv2
+def enhance_contrast(image):
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(image)
+normalized_scans = np.array([enhance_contrast(img) for img in scan_data])
+data_augmentation = tf.keras.Sequential([
+    tf.keras.layers.RandomFlip("horizontal_and_vertical"),
+    tf.keras.layers.RandomRotation(0.2),
+    tf.keras.layers.RandomZoom(0.2),
+])
+
+lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+    initial_learning_rate=0.001, decay_steps=10000, decay_rate=0.9
+)
+optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+
+from sklearn.utils.class_weight import compute_class_weight
+class_weights = compute_class_weight('balanced', classes=np.unique(numeric_labels), y=numeric_labels)
+class_weights = dict(enumerate(class_weights))
+history = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=32, class_weight=class_weights)
